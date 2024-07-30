@@ -1,0 +1,15 @@
+boto3
+diffusers
+fastapi
+numpy
+Pillow
+pydantic
+requests
+torch
+typing-extensions
+uvicorn
+openai
+accelerate
+transformers
+sentencepiece
+python-dotenv
