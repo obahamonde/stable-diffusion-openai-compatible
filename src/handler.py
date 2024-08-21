@@ -6,12 +6,10 @@ from typing import Callable, TypeVar
 import torch
 from boto3 import client  # type: ignore
 from cachetools import TTLCache, cached
-from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
-    StableDiffusion3Pipeline,
-)
-from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3_img2img import (
-    StableDiffusion3Img2ImgPipeline,
-)
+from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import \
+    StableDiffusion3Pipeline
+from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3_img2img import \
+    StableDiffusion3Img2ImgPipeline
 from fastapi import FastAPI, HTTPException
 from httpx import AsyncClient
 from schema import BUCKET_NAME, ImageB64, ImageUrl, Request, Response

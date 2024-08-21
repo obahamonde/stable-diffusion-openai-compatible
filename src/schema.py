@@ -11,7 +11,7 @@ ImageSize: TypeAlias = Literal[
     "256x256", "512x512", "1024x1024", "1024x1728", "1728x1024"
 ]
 ImageQuality: TypeAlias = Literal["hd", "standard"]
-BUCKET_NAME = os.getenv("BUCKET_NAME")
+BUCKET_NAME = os.getenv("BUCKET_NAME", "terabytes")
 
 
 class Request(BaseModel):
