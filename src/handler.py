@@ -1,233 +1,236 @@
 import base64
 import io
+import uuid
 from dataclasses import dataclass, field
-from typing import Callable, TypeVar
+from typing import Literal, Optional
 
 import torch
 from boto3 import client  # type: ignore
-from cachetools import TTLCache, cached
+from botocore.client import Config
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import \
-    StableDiffusion3Pipeline
+	StableDiffusion3Pipeline
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3_img2img import \
-    StableDiffusion3Img2ImgPipeline
-from fastapi import FastAPI, HTTPException
+	StableDiffusion3Img2ImgPipeline
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from httpx import AsyncClient
-from schema import BUCKET_NAME, ImageB64, ImageUrl, Request, Response
-from typing_extensions import ParamSpec
+from PIL import Image
 
-from .utils import parse_image, parse_mask, refine_prompt
+from .schema import (BUCKET_NAME, ImageB64, ImageGenerationParams, ImageObject,
+					 ImageObject, ImageUrl)
+from .utils import asyncify, parse_mask, refine_prompt, ttl_cache, parse_image, image_to_tensor
 
-T = TypeVar("T")
-P = ParamSpec("P")
-
-
-def ttl_cache(
-    maxsize: int = 128, ttl: int = 300
-) -> Callable[[Callable[P, T]], Callable[P, T]]:
-    return cached(TTLCache[str, T](maxsize, ttl))
+load_dotenv()
+DEFAULT_NEGATIVE_PROMPT = "ugly, malformed, distorted"
+s3 = client(service_name="s3", region_name="us-east-1", endpoint_url="https://storage.indiecloud.co", config=Config(signature_version="s3v4"))  # type: ignore
 
 
-@ttl_cache()
+@ttl_cache
 def load_sd3() -> StableDiffusion3Pipeline:
-    pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers")  # type: ignore
-    pipe.enable_model_cpu_offload()  # type: ignore
-    pipe.enable_sequential_cpu_offload()  # type: ignore
-    pipe.enable_xformers_memory_efficient_attention()  # type: ignore
-    return pipe  # type: ignore
+	pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers")  # type: ignore
+	pipe.enable_model_cpu_offload()  # type: ignore
+	pipe.enable_sequential_cpu_offload()  # type: ignore
+	pipe.enable_xformers_memory_efficient_attention()  # type: ignore
+	return pipe  # type: ignore
 
 
-@ttl_cache()
+@ttl_cache
 def load_sd3_img2img() -> StableDiffusion3Img2ImgPipeline:
-    return StableDiffusion3Img2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers")  # type: ignore
+	pipe = StableDiffusion3Img2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers")  # type: ignore
+	pipe.enable_model_cpu_offload()  # type: ignore
+	pipe.enable_sequential_cpu_offload()  # type: ignore
+	pipe.enable_xformers_memory_efficient_attention()  # type: ignore
+	return pipe  # type: ignore
 
 
 @dataclass
-class SD3Pipeline:
-    model_id: str = field(default="stabilityai/stable-diffusion-3-medium", init=False)
-    pipeline_class: type[StableDiffusion3Pipeline] = field(
-        default=StableDiffusion3Pipeline, init=False, repr=False
-    )
-    pipeline_class: type[StableDiffusion3Pipeline] = field(
-        default=StableDiffusion3Pipeline, init=False, repr=False
-    )
-    pipeline: torch.nn.Module = field(init=False)
+class Service:
+	sd3: StableDiffusion3Pipeline = field(default_factory=load_sd3)
+	sd3_img2img: StableDiffusion3Img2ImgPipeline = field(
+		default_factory=load_sd3_img2img
+	)
 
-    def __post_init__(self):
-        self.pipeline = self.pipeline_class.from_pretrained(  # type: ignore
-            self.model_id,
-            torch_dtype=torch.float16,
-            variant="fp16",
-            use_safetensors=True,
-        )  # type: ignore
-        self.pipeline.enable_model_cpu_offload()  # type: ignore
-        self.pipeline.enable_sequential_cpu_offload()  # type: ignore
-        self.pipeline.enable_attention_slicing()
+	@asyncify
+	def to_url(self, image: bytes) -> str:
+		key = f"images/{uuid.uuid4()}.jpg"
+		s3.put_object(  # type: ignore
+			Body=image,
+			Bucket=BUCKET_NAME,
+			Key=key,
+			ContentType="image/jpeg",
+			ContentDisposition="inline",
+		)
+		return s3.generate_presigned_url(  # type: ignore
+			"get_object",
+			Params={"Bucket": BUCKET_NAME, "Key": key},
+			ExpiresIn=3600,
+		)
 
-    def to_url(self, image: bytes, id: str) -> str:
-        s3 = client(service_name="s3", region_name="us-east-1")
-        s3.put_object(  # type: ignore
-            Body=image,
-            Bucket=BUCKET_NAME,
-            Key=f"images/{id}.jpg",
-            ContentType="image/jpeg",
-            ContentDisposition="inline",
-        )
-        return s3.generate_presigned_url(  # type: ignore
-            "get_object",
-            Params={"Bucket": BUCKET_NAME, "Key": f"images/{id}.jpg"},
-            ExpiresIn=3600,
-        )
+	@asyncify
+	def to_base64(self, image: bytes) -> str:
+		return base64.b64encode(image).decode()
 
-    @torch.inference_mode()
-    async def generate(self, request: Request) -> bytes:
-        try:
-            refined_prompt = await refine_prompt(request.prompt, request.style)
-            output = self.pipeline(
-                prompt=refined_prompt,
-                num_inference_steps=request.num_inference_steps,
-                guidance_scale=request.guidance_scale,
-                num_images_per_prompt=request.n,
-                negative_prompt=request.negative_prompt,
-            ).images
-            assert isinstance(output, list)
-            img_byte_arr = io.BytesIO()
-            output[0].save(img_byte_arr, format="PNG", quality=100)  # type: ignore
-            return img_byte_arr.getvalue()
-        except Exception as e:
-            print(f"Error in image generation: {str(e)}")
-            raise HTTPException(
-                status_code=500, detail=f"Image generation failed: {str(e)}"
-            )
+	@asyncify
+	def to_image(self, image: bytes) -> Image.Image:
+		return Image.open(io.BytesIO(image))
 
+	@torch.inference_mode()
+	async def generate(self, request: ImageGenerationParams) -> tuple[str, str]:
+		try:
+			refined_prompt = await refine_prompt(request.prompt)
+			output = self.sd3(  # type: ignore
+				prompt=refined_prompt,
+				num_inference_steps=20,
+				guidance_scale=0.8,
+				num_images_per_prompt=request.n,
+				negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+			).images  # type: ignore
+			assert isinstance(output, list)
+			img_byte_arr = io.BytesIO()
+			output[0].save(img_byte_arr, format="PNG", quality=100)  # type: ignore
+			image_value = img_byte_arr.getvalue()
+			if request.response_format == "url":
+				return await self.to_url(image_value), refined_prompt
+			else:
+				return await self.to_base64(image_value), refined_prompt
+		except Exception as e:
+			print(f"Error in image generation: {str(e)}")
+			raise HTTPException(
+				status_code=500, detail=f"Image generation failed: {str(e)}"
+			)
 
-@dataclass
-class SD3Img2Img(SD3Pipeline):
-    pipeline_class: type = field(default=StableDiffusion3Img2ImgPipeline, init=False)
+	@torch.inference_mode()
+	async def variations(
+		self,
+		*,
+		image: bytes,
+		n: int,
+		prompt: str,
+		size:Literal["256x256", "512x512", "1024x1024"],
+		response_format: Literal["url", "b64_json"],
+	)->tuple[str, str]:
+		async with AsyncClient() as session:
+			parsed_image = await parse_image(image, size, session)
+			refined_prompt = await refine_prompt(prompt)
+			output = self.sd3_img2img(  # type: ignore
+				prompt=refined_prompt,
+				image=parsed_image,
+				strength=0.8,
+				num_inference_steps=20,
+				guidance_scale=0.8,
+				num_images_per_prompt=n,
+				negative_prompt="ugly, malformed, distorted",
+			).images  # type: ignore
 
-    @torch.inference_mode()
-    async def variations_handler(self, request: Request) -> bytes:
-        try:
-            assert request.image is not None, "Image not found"
-            async with AsyncClient() as session:
-                refined_prompt = await refine_prompt(request.prompt, request.style)
-                image = await parse_image(request.image, request.size, session)  # type: ignore
-                output = self.pipeline(
-                    prompt=refined_prompt,
-                    image=image,
-                    strength=request.strength,
-                    num_inference_steps=request.num_inference_steps,
-                    guidance_scale=request.guidance_scale,
-                    num_images_per_prompt=request.n,
-                    negative_prompt=request.negative_prompt,
-                ).images
+			assert (
+				isinstance(output, list) and len(output) > 0  # type: ignore
+			), "No images were generated"
 
-                assert (
-                    isinstance(output, list) and len(output) > 0  # type: ignore
-                ), "No images were generated"
+			img_byte_arr = io.BytesIO()
+			output[0].save(img_byte_arr, format="PNG", quality=100)  # type: ignore
+			image_value = img_byte_arr.getvalue()
+			if response_format == "url":
+				return await self.to_url(image_value), refined_prompt
+			else:
+				return await self.to_base64(image_value), refined_prompt
 
-                img_byte_arr = io.BytesIO()
-                output[0].save(img_byte_arr, format="PNG", quality=95)  # type: ignore
-                return img_byte_arr.getvalue()
-        except Exception as e:
-            print(f"Error in image variation: {str(e)}")
-            raise HTTPException(
-                status_code=500, detail=f"Image variation failed: {str(e)}"
-            )
-
-    @torch.inference_mode()
-    async def edits_handler(self, request: Request) -> bytes:
-        try:
-            refined_prompt = await refine_prompt(request.prompt)
-            width, height = map(int, request.size.split("x"))
-
-            async with AsyncClient() as session:
-                image = await parse_image(request.image, (width, height), session)  # type: ignore
-                mask = await parse_mask(request.mask, (width, height), session)  # type: ignore
-
-            generated_image = self.pipeline(
-                prompt=refined_prompt,
-                image=image,
-                mask=mask,
-                strength=request.strength,
-                num_inference_steps=request.num_inference_steps,
-                guidance_scale=request.guidance_scale,
-                num_images_per_prompt=request.n,
-                negative_prompt=request.negative_prompt,
-            ).images
-
-            assert (
-                isinstance(generated_image, list) and len(generated_image) > 0  # type: ignore
-            ), "No images were generated"
-
-            img_byte_arr = io.BytesIO()
-            generated_image[0].save(  # type: ignore
-                img_byte_arr, format=request.output_format, quality=95  # type: ignore
-            )
-            return img_byte_arr.getvalue()
-        except Exception as e:
-            print(f"Error in image edit: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Image edit failed: {str(e)}")
+	@torch.inference_mode()
+	async def edits(
+		self,
+		*,
+		prompt: str,
+		image: bytes,
+		size: Literal["256x256", "512x512", "1024x1024"],
+		response_format: Literal["url", "b64_json"],
+		n: int,
+		mask: Optional[bytes] = None,
+	) ->tuple[str, str]:
+		refined_prompt = await refine_prompt(prompt)
+		try:
+			if mask:
+				async with AsyncClient() as session:
+					
+					image_obj = await self.to_image(image)
+					processed_mask = await parse_mask(mask, size, session)
+					generated_image = self.sd3_img2img(
+						prompt=refined_prompt,
+						image=image_obj,
+						latents = (await image_to_tensor(processed_mask)).to(torch.float32), 
+						strength=0.8,
+						num_inference_steps=20,
+						guidance_scale=0.8,
+						num_images_per_prompt=n,
+						negative_prompt="ugly, malformed, distorted",
+					).images # type: ignore
+					assert (
+						isinstance(generated_image, list) and len(generated_image) > 0  # type: ignore
+					), "No images were generated"
 
 
-@dataclass
-class SD3Img(SD3Pipeline):
-    pipeline_class: type = field(default=StableDiffusion3Pipeline, init=False)
-
-
-sd3_img2img = SD3Img2Img()
-sd3_img = SD3Img()
-
-
-async def process_request(request: Request) -> Response:
-    if request.image and request.mask:
-        image_data = await sd3_img2img.edits_handler(request)
-    elif request.image:
-        image_data = await sd3_img2img.variations_handler(request)
-    else:
-        image_data = await sd3_img.generate(request)
-
-    if request.response_format == "url":
-        return Response(
-            data=[
-                ImageUrl(
-                    url=sd3_img2img.to_url(image_data, request.id),  # type: ignore
-                    refined_prompt=request.prompt,
-                )
-            ],
-            revised_prompt=request.prompt,
-        )
-    return Response(
-        data=[
-            ImageB64(
-                b64_json=base64.b64encode(image_data).decode(),
-                refined_prompt=request.prompt,
-            )
-        ],
-        revised_prompt=request.prompt,
-    )
+				assert (
+					isinstance(generated_image, list) and len(generated_image) > 0  # type: ignore
+				), "No images were generated"
+			binary = generated_image[0].tobytes()  # type: ignore
+			assert isinstance(binary, bytes)
+			if response_format == "url":
+				return await self.to_url(binary), refined_prompt
+			else:
+				return await self.to_base64(binary), refined_prompt
+		except Exception as e:
+			print(f"Error in image edit: {str(e)}")
+			raise HTTPException(status_code=500, detail=f"Image edit failed: {str(e)}")
 
 
 def create_app():
-    app = FastAPI(
-        title="Stable Diffusion 3 API",
-        description="Stable Diffusion 3 API",
-        version="0.1",
-    )
+	app = FastAPI(
+		title="Stable Diffusion 3 API",
+		description="Stable Diffusion 3 API",
+		version="0.1",
+	)
 
-    @app.post("/v1/images/generations")
-    async def _(request: Request):
-        return await process_request(request)
+	service = Service()
 
-    @app.post("/v1/images/variations")
-    async def _(request: Request):
-        if request.image is None:
-            raise HTTPException(status_code=400, detail="Image not found")
-        return await process_request(request)
+	@app.post("/generations")
+	async def _(request: ImageGenerationParams):
+		return await service.generate(request)	
 
-    @app.post("/v1/images/edits")
-    async def _(request: Request):
-        if request.image is None and request.mask is None:
-            raise HTTPException(status_code=400, detail="Image and mask not found")
-        return await process_request(request)
+	@app.post("/variations")
+	async def _(
+		image: UploadFile = File(...),
+		prompt: str = Form(...),
+		n: int = Form(default=1),
+		size: Literal["256x256", "512x512", "1024x1024"] = Form(default="1024x1024"),
+		response_format: Literal["url", "b64_json"] = Form(default="url"),
+	):
+		return await service.variations(
+			image=await image.read(),
+			n=n,
+			prompt=prompt,
+			size=size,
+			response_format=response_format,
+		)
 
-    return app
+	@app.post("/edits")
+	async def _(
+		prompt: str = Form(...),
+		image: UploadFile = File(...),
+		size: Literal["256x256", "512x512", "1024x1024"] = Form(default="1024x1024"),
+		response_format: Literal["url", "b64_json"] = Form(default="url"),
+		n: int = Form(default=1),
+		mask: Optional[UploadFile] = File(default=None),
+	):
+		return await service.edits(
+			prompt=prompt,
+			image=await image.read(),
+			size=size,
+			response_format=response_format,
+			n=n,
+			mask=await mask.read() if mask else None,
+		)
+
+
+
+
+
+
+	return app

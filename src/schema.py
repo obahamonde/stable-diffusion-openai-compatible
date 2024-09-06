@@ -1,52 +1,46 @@
 import os
 from datetime import datetime
 from typing import Literal, Optional, Union
-from uuid import uuid4
 
-from pydantic import BaseModel, Field, HttpUrl, computed_field
+from pydantic import BaseModel, Field, HttpUrl
 from typing_extensions import Required, TypeAlias, TypedDict
 
-ImageStyle: TypeAlias = Literal["vivid", "natural"]
-ImageSize: TypeAlias = Literal[
-    "256x256", "512x512", "1024x1024", "1024x1728", "1728x1024"
-]
-ImageQuality: TypeAlias = Literal["hd", "standard"]
 BUCKET_NAME = os.getenv("BUCKET_NAME", "terabytes")
 
 
-class Request(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    model: Literal["stabilityai/stable-diffusion-3-medium-diffusers"] = Field(
-        default="stabilityai/stable-diffusion-3-medium-diffusers"
+class ImageGenerationParams(BaseModel):
+    prompt: str = Field(
+        ...,
+        max_length=4000,
+        description="A text description of the desired image(s). Max length is 1000 characters for dall-e-2 and 4000 for dall-e-3.",
     )
-    prompt: str = Field(default=...)
-    quality: ImageQuality = Field(default="hd")
-    response_format: Literal["url", "b64_json"] = Field(default="url")
-    size: ImageSize = Field(
-        default="1024x1024",
-        description="The size of the generated images. Must be one of 256x256, 512x512, 1024x1024, 1792x1024, or 1024x1792.",
+    model: Literal["dall-e-2", "dall-e-3"] = Field(
+        default="dall-e-2", description="The model to use for image generation."
     )
-    n: int = Field(
+    n: Optional[int] = Field(
         default=1,
-        description="The number of images to generate. Must be between 1 and 10",
+        ge=1,
+        le=10,
+        description="The number of images to generate. Must be between 1 and 10. For dall-e-3, only n=1 is supported.",
     )
-    style: ImageStyle = Field(
+    quality: Optional[Literal["standard", "hd"]] = Field(
+        default="standard",
+        description="The quality of the image. 'hd' creates images with finer details.",
+    )
+    response_format: Optional[Literal["url", "b64_json"]] = Field(
+        default="url",
+        description="The format in which the generated images are returned. URLs are valid for 60 minutes.",
+    )
+    size: Optional[
+        Literal["256x256", "512x512", "1024x1024", "1792x1024", "1024x1792"]
+    ] = Field(
+        default="1024x1024",
+        description="The size of the generated images. '256x256', '512x512', '1024x1024' for dall-e-2. '1024x1024', '1792x1024', '1024x1792'.",
+    )
+    style: Optional[Literal["vivid", "natural"]] = Field(
         default="vivid",
-        description="The style of the generated images. Must be one of vivid or natural. Vivid causes the model to lean towards generating hyper-real and dramatic images. Natural causes the model to produce more natural, less hyper-real looking images.",
+        description="The style of the generated images. Only supported for dall-e-3.",
     )
-    image: Optional[Union[HttpUrl, str, bytes]] = Field(default=None)
-    mask: Optional[Union[str, bytes]] = Field(default=None)
-    strength: float = Field(default=0.8)
-    guidance_scale: float = Field(default=7.5)
-    negative_prompt: str = Field(
-        default="blurry image, low quality image, body parts, deformed, grotesque, scary, gore"
-    )
-
-    @computed_field(return_type=int)
-    def num_inference_steps(self):
-        if self.quality == "hd":
-            return 36
-        return 18
 
 
 class ImageUrl(TypedDict):
@@ -62,7 +56,7 @@ class ImageB64(TypedDict):
 ImageGeneration: TypeAlias = Union[ImageUrl, ImageB64]
 
 
-class Response(BaseModel):
+class ImageObject(BaseModel):
     created: float = Field(default_factory=lambda: datetime.now().timestamp())
     data: list[ImageGeneration]
     revised_prompt: Optional[str] = Field(default=None)

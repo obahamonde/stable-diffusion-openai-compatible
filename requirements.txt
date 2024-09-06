@@ -13,3 +13,8 @@ accelerate
 transformers
 sentencepiece
 python-dotenv
+cachetools
+xformers
+protobuf
+python-multipart
+python-dotenv

@@ -8,15 +8,26 @@ from typing import Awaitable, Callable, Literal, TypeVar, Union
 
 import numpy as np
 import torch
+from cachetools import TTLCache, cached
 from httpx import AsyncClient, get
 from openai import AsyncOpenAI
 from PIL import Image
-from typing_extensions import ParamSpec, TypeAlias
+from typing_extensions import ParamSpec
 
 T = TypeVar("T")
 P = ParamSpec("P")
+INSTRUCTIONS = """Analyze the user's input and generate a detailed, compelling prompt for Stable Diffusion. Capture the core intent of the request, whether it's for a logo, illustration, photograph, or any other type of image. Infer and include key details such as style, mood, color palette, lighting, and composition. If specific elements are not mentioned, use appropriate defaults that align with the overall concept. Incorporate relevant descriptors to enhance image quality and clarity. Aim to create a prompt that will produce a visually appealing result matching the user's vision. Be comprehensive yet concise, focusing on the most impactful aspects of the desired image. Avoid restrictive language and allow for creative interpretation within the bounds of the user's request. Craft the prompt to guide the AI towards generating an image that the user will find satisfying and engaging."""
 
 ai = AsyncOpenAI()
+
+
+def ttl_cache(func: Callable[P, T], *, maxsize: int = 128, ttl: int = 300):
+    @cached(TTLCache[str, T](maxsize=maxsize, ttl=ttl))
+    @wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        return func(*args, **kwargs)
+
+    return wrapper
 
 
 def asyncify(func: Callable[P, T]) -> Callable[P, Awaitable[T]]:
@@ -25,13 +36,6 @@ def asyncify(func: Callable[P, T]) -> Callable[P, Awaitable[T]]:
         return await asyncio.to_thread(func, *args, **kwargs)
 
     return wrapper
-
-
-ImageStyle: TypeAlias = Literal["vivid", "natural"]
-ImageSize: TypeAlias = Literal[
-    "256x256", "512x512", "1024x1024", "1024x1728", "1728x1024"
-]
-ImageQuality: TypeAlias = Literal["hd", "standard"]
 
 
 @asyncify
@@ -58,8 +62,10 @@ def parse_byte_str_to_image(data: Union[str, bytes]) -> Image.Image:
 
 
 async def parse_image(
-    image_data: Union[str, bytes], size: ImageSize, session: AsyncClient
-) -> Image.Image:
+    image_data: Union[str, bytes],
+    size: Literal["256x256", "512x512", "1024x1024"],
+    session: AsyncClient,
+):
     if isinstance(image_data, str):
         if image_data.startswith("http"):
             image_content = (await session.get(image_data)).content
@@ -72,8 +78,10 @@ async def parse_image(
 
 
 async def parse_mask(
-    mask_data: Union[str, bytes], size: ImageSize, session: AsyncClient
-) -> Image.Image:
+    mask_data: Union[str, bytes],
+    size: Literal["256x256", "512x512", "1024x1024", "1792x1024", "1024x1792"],
+    session: AsyncClient,
+):
     if isinstance(mask_data, str):
         if mask_data.startswith("http"):
             mask_content = (await session.get(mask_data)).content
@@ -87,20 +95,11 @@ async def parse_mask(
     return mask.resize(size=(int(size.split("x")[0]), int(size.split("x")[1])))
 
 
-async def refine_prompt(prompt: str, style: ImageStyle = "vivid") -> str:
-    """
-    Refine the given prompt for optimal Stable Diffusion image generation in the specified style (vivid or natural).
-    Vivid: Generates hyper-real and dramatic images.
-    Natural: Generates more natural and less hyper-real images.
-    """
-    instructions = f"""Refine this prompt for a more {style} styled Stable Diffusion image generation. Be more descriptive regarding the content. 
-    For example: 
-    'Colorful bird with turquoise beak in lush forest.' optimized to 'A vibrant and exotic bird in a lush forest setting, featuring a turquoise beak and adorned with an array of colorful feathers in red, purple, and green hues. The bird has intricate details, including beaded decorations around its neck and a feathered headdress. The background is a soft blur of green foliage, highlighting the bird's striking appearance. The image is highly detailed and vivid, with a focus on the intricate patterns and bright colors of the bird's plumage.'"""
-
+async def refine_prompt(prompt: str) -> str:
     response = await ai.chat.completions.create(
         model="llama3-8b-8192",
         messages=[
-            {"role": "system", "content": instructions},
+            {"role": "system", "content": INSTRUCTIONS},
             {"role": "user", "content": prompt},
         ],
         max_tokens=256,
